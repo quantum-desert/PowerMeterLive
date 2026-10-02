@@ -1,4 +1,4 @@
-Power Meter Live  v1.3
+Power Meter Live  v1.4
 ======================
 
 A small Windows app that shows a live, rolling plot of the optical power read
@@ -15,6 +15,10 @@ GETTING STARTED
    The first run sets up a private Python environment (.venv) in the folder
    and downloads the packages; that takes a minute and needs internet.
    Later runs start straight away.
+   It also puts "Power Meter Live" shortcuts (with the app's icon) in this
+   folder and on the desktop; start the app from those from now on, or
+   right-click one > Pin to taskbar / Pin to Start. If the folder moves,
+   delete "Power Meter Live.lnk" here and run run.bat again.
 3. Choose the connection, then press Start.
 
 To try it without hardware:  run.bat --sim   (or pick "Simulated").
@@ -78,7 +82,8 @@ a continuous measurement is an operation that never completes.)
 SINGLE-FILE .EXE (OPTIONAL)
 ---------------------------
 After running run.bat once, double-click build_exe.bat to make
-dist\PowerMeterLive.exe, which runs on PCs without Python installed.
+dist\PowerMeterLive.exe (with the icon), which runs on PCs without Python
+installed. Copy that one file to other PCs.
 
 
 FILES
@@ -87,3 +92,4 @@ power_meter_live.py   the program (one file)
 requirements.txt      Python packages it needs
 run.bat               launcher; sets up .venv on the first run
 build_exe.bat         optional single-file .exe build
+assets\               the app icon (.ico for Windows, .png)

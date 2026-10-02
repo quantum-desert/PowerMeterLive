@@ -30,7 +30,7 @@ from collections import deque
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg  # imported after PySide6 so pyqtgraph uses it
 
 APP_NAME = "Power Meter Live"
-VERSION = "1.3"
+VERSION = "1.4"
 
 UNITS = [("pW", 1e12), ("nW", 1e9), ("µW", 1e6), ("mW", 1e3), ("W", 1.0)]
 SCALE = dict(UNITS)
@@ -1045,9 +1045,26 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def asset(name: str) -> str:
+    """Path of a bundled file, next to this script or inside a PyInstaller .exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "assets", name)
+
+
 def main() -> int:
+    if sys.platform == "win32":
+        # Own taskbar identity, so Windows shows this app's icon rather than Python's
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Lab.PowerMeterLive")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    icon = QIcon(asset("power_meter_live.ico"))
+    if icon.isNull():
+        icon = QIcon(asset("power_meter_live.png"))
+    app.setWindowIcon(icon)
     pg.setConfigOptions(antialias=True)
     win = MainWindow(simulate="--sim" in sys.argv)
     win.show()

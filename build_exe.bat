@@ -1,6 +1,6 @@
 @echo off
-rem Optional: builds dist\PowerMeterLive.exe, a single file that runs on PCs
-rem without Python. Run run.bat once first so the .venv exists.
+rem Optional: builds dist\PowerMeterLive.exe, a single file with the app's icon
+rem that runs on PCs without Python. Run run.bat once first so the .venv exists.
 setlocal
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
@@ -10,7 +10,9 @@ if not exist ".venv\Scripts\python.exe" (
 )
 ".venv\Scripts\python.exe" -m pip install pyinstaller
 ".venv\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed ^
-    --name PowerMeterLive --collect-submodules pyvisa_py power_meter_live.py
+    --name PowerMeterLive --icon assets\power_meter_live.ico ^
+    --add-data "assets;assets" ^
+    --collect-submodules pyvisa_py power_meter_live.py
 if errorlevel 1 (
     echo Build failed - see the messages above.
     pause

@@ -1,6 +1,8 @@
 @echo off
-rem Optional: builds dist\PowerMeterLive.exe, a single file with the app's icon
-rem that runs on PCs without Python. Run run.bat once first so the .venv exists.
+rem Builds PowerMeterLive.exe, a single file with the app's icon that runs on
+rem PCs without Python, and copies it to the parent folder (..\PowerMeterLive.exe).
+rem The .exe holds a frozen copy of the code: run this again after every change
+rem to power_meter_live.py. Run run.bat once first so the .venv exists.
 setlocal
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
@@ -18,6 +20,14 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+copy /Y "dist\PowerMeterLive.exe" "..\PowerMeterLive.exe" >nul
+if errorlevel 1 (
+    echo.
+    echo Built dist\PowerMeterLive.exe, but could not replace ..\PowerMeterLive.exe.
+    echo Close Power Meter Live if it is running, then run this again.
+    pause
+    exit /b 1
+)
 echo.
-echo Done: dist\PowerMeterLive.exe
+echo Done: updated %~dp0..\PowerMeterLive.exe
 pause

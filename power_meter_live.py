@@ -9,6 +9,7 @@ FETC<n>:POW? on a timer into a rolling window, with:
 * big readout (+ dBm), mean / std dev / min / max, samples, eta vs a reference,
   elapsed time and read rate
 * auto or fixed y-range with "Fit to data", a goal line, Clear, Export CSV
+* laser on/off for a laser source module (e.g. HP 81689A, slot 1 by default)
 
 Readings are converted to watts whether the meter displays W or dBm. In
 relative (dB) mode there is no absolute power, so samples show as gaps.
@@ -22,6 +23,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+import queue
 import random
 import re
 import sys
@@ -39,7 +41,7 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg  # imported after PySide6 so pyqtgraph uses it
 
 APP_NAME = "Power Meter Live"
-VERSION = "1.4"
+VERSION = "1.5"
 
 UNITS = [("pW", 1e12), ("nW", 1e9), ("µW", 1e6), ("mW", 1e3), ("W", 1.0)]
 SCALE = dict(UNITS)
@@ -52,7 +54,8 @@ LINE = "#2a78d6"
 
 DEFAULTS = {
     "link": "serial", "com_port": "COM4", "baud": 9600, "flow": "none",
-    "gpib_board": 0, "gpib_address": 20, "resource": "", "pm_slot": 2, "timeout_ms": 3000,
+    "gpib_board": 0, "gpib_address": 20, "resource": "", "pm_slot": 2, "laser_slot": 1,
+    "timeout_ms": 3000,
     "window": 500, "interval_ms": 150, "unit": "µW", "auto_y": True,
     "y_min": 0.0, "y_max": 50.0, "goal": None, "reference": None,
 }
@@ -111,6 +114,20 @@ def resource_string(cfg: dict) -> str:
     return port if "::" in port else f"ASRL{port}::INSTR"
 
 
+def module_model(idn: str) -> str:
+    """'HEWLETT-PACKARD,81689A,DE123,V4.2' -> '81689A'."""
+    parts = [p.strip() for p in str(idn).split(",")]
+    return parts[1] if len(parts) > 1 and parts[1] else (parts[0] if parts else "")
+
+
+def _is_command_error(err: str) -> bool:
+    """SCPI -100 ... -199: the command itself wasn't understood."""
+    try:
+        return -199 <= int(err.split(",")[0]) <= -100
+    except ValueError:
+        return False
+
+
 def serial_ports() -> list[str]:
     try:
         from serial.tools import list_ports
@@ -125,16 +142,22 @@ def serial_ports() -> list[str]:
 # ---------------------------------------------------------------------------
 
 class SimMeter:
-    """Stands in for a pyvisa resource: an 8163A with a power meter in every slot."""
+    """Stands in for a pyvisa resource: an 8163A with an 81689A laser in slot 1 and
+    power meters in the other slots. The power follows the laser."""
 
     def __init__(self) -> None:
         self.t0 = time.time()
         self.cont = 0
+        self.laser = 0
+        self.laser_t = 0.0
 
     def write(self, cmd: str) -> None:
         c = cmd.upper()
         if c.startswith("INIT") and ":CONT" in c:
             self.cont = 1 if c.rstrip().endswith(("1", "ON")) else 0
+        if c.startswith("OUTP1") or c.startswith("SOUR1:POW:STAT"):
+            self.laser = 1 if c.rstrip().endswith(("1", "ON")) else 0
+            self.laser_t = time.time()
 
     def query(self, cmd: str) -> str:
         time.sleep(0.004)
@@ -147,8 +170,14 @@ class SimMeter:
             return '+0,"No error"'
         if c.startswith("SLOT") and "EMPT" in c:
             return "+0"
+        if c.startswith("SLOT1:IDN"):
+            return "HEWLETT-PACKARD,81689A,SIMULATED,V4.20"
         if c.startswith("SLOT") and "IDN" in c:
             return "HEWLETT-PACKARD,81532A,SIMULATED,V4.20"
+        if c.startswith(("OUTP1", "SOUR1:POW:STAT")):
+            return f"+{self.laser}"
+        if c.startswith("LOCK"):
+            return "+0"
         if c.startswith("INIT"):
             return f"+{self.cont}"
         if "UNIT?" in c:
@@ -160,6 +189,10 @@ class SimMeter:
         if c.startswith(("FETC", "READ")):
             t = time.time() - self.t0
             w = 20e-6 * (1 + 0.35 * math.sin(2 * math.pi * t / 30)) * (1 + random.gauss(0, 0.01))
+            if not self.laser:
+                w = abs(random.gauss(5e-12, 2e-12))       # dark: noise floor
+            elif time.time() - self.laser_t < 1.5:        # the laser settles after switching on
+                w *= (time.time() - self.laser_t) / 1.5
             return f"{w:+.8E}"
         return "0"
 
@@ -176,6 +209,9 @@ class Meter:
     def __init__(self, cfg: dict) -> None:
         self.cfg = cfg
         self.slot = int(cfg["pm_slot"])
+        self.laser_slot = int(cfg.get("laser_slot", 0) or 0)
+        self.laser_hdr = f"OUTP{self.laser_slot}:STAT"   # or SOUR<n>:POW:STAT, see set_laser
+        self.laser_idn = ""
         self.res = None
         self.unit = 1            # meter display unit: 1 = W, 0 = dBm
         self.relative = False    # reference state: relative readings are in dB
@@ -267,6 +303,7 @@ class Meter:
     def write(self, cmd: str) -> str:
         """A setting command, then SYST:ERR? before anything else is sent.
         Returns the error reply ('' when the command was accepted)."""
+        self.errors()              # leftovers, so they aren't blamed on this command
         self.res.write(cmd)
         err = self._sync()
         return "" if re.match(r"^[+]?0\s*,", err) else err
@@ -354,6 +391,74 @@ class Meter:
             self._drain()          # its reply may still arrive; don't let it answer the next query
             return None
 
+    # -- laser source (e.g. HP 81689A) -------------------------------------------
+    def open_laser(self) -> dict | None:
+        """Look for the laser module; None when no laser slot is set."""
+        L = self.laser_slot
+        if not L:
+            return None
+        if L == self.slot:
+            return {"slot": L, "present": False,
+                    "why": f"Laser slot {L} is the power meter's slot."}
+        if (parse_float(self._opt(f"SLOT{L}:EMPT?")) or 0) == 1:
+            return {"slot": L, "present": False, "why": f"Slot {L} is empty."}
+        self.laser_idn = (self._opt(f"SLOT{L}:IDN?") or "").strip()
+        if not self.laser_idn.strip(", "):
+            return {"slot": L, "present": False, "why": f"No module answers in slot {L}."}
+        return self.laser_info()
+
+    def laser_info(self) -> dict:
+        L = self.laser_slot
+        return {"slot": L, "present": True, "module": self.laser_idn,
+                "model": module_model(self.laser_idn), "on": self.laser_state(),
+                "wavelength_m": parse_float(self._opt(f"SOUR{L}:WAV?"))}
+
+    def laser_state(self):
+        v = parse_float(self._opt(f"{self.laser_hdr}?"))
+        if v is None:              # this module may only know the other form
+            L = self.laser_slot
+            alt = (f"SOUR{L}:POW:STAT" if self.laser_hdr.startswith("OUTP")
+                   else f"OUTP{L}:STAT")
+            v = parse_float(self._opt(f"{alt}?"))
+            if v is not None:
+                self.laser_hdr = alt
+            self.errors()          # drop the 'undefined header' the first try left
+        return None if v is None else bool(v)
+
+    def set_laser(self, on: bool) -> dict:
+        """Switch the laser output and wait (up to 8 s) until the module reports it."""
+        L = self.laser_slot
+        if not L:
+            raise RuntimeError("No laser slot is set.")
+        errs = []
+        err = self.write(f"{self.laser_hdr} {1 if on else 0}")
+        if err and _is_command_error(err):
+            # some firmware/modules only know the other form; try it once and keep it
+            alt = (f"SOUR{L}:POW:STAT" if self.laser_hdr.startswith("OUTP")
+                   else f"OUTP{L}:STAT")
+            err2 = self.write(f"{alt} {1 if on else 0}")
+            if not err2:
+                self.laser_hdr, err = alt, ""
+            else:
+                errs += [err, err2]
+        elif err:
+            errs.append(err)
+        deadline = time.monotonic() + 8.0
+        state = None
+        while time.monotonic() < deadline:
+            state = self.laser_state()
+            if state == on:
+                return self.laser_info()
+            time.sleep(0.3)
+        errs += self.errors()
+        why = ""
+        if on and parse_float(self._opt("LOCK?")) == 1:
+            why = ("\n\nThe 8163A's lasers are locked (LOCK? = 1). Unlock them on the front "
+                   "panel (laser lock / password; the factory password is 1234), then try again.")
+        raise RuntimeError(
+            f"The laser in slot {L} did not switch {'on' if on else 'off'} "
+            f"({self.laser_hdr}? = {state}). Meter errors: {'; '.join(errs) or 'none'}.{why}")
+
     def read_unit(self) -> None:
         n = self.slot
         u = parse_float(self._opt(f"SENS{n}:POW:UNIT?"))
@@ -391,6 +496,8 @@ class Reader(QThread):
     connected = Signal(dict)       # idn, module, wavelength_m
     meter_mode = Signal(int, bool)  # display unit (1 W / 0 dBm), relative
     sample = Signal(float, float)  # unix time, watts
+    laser = Signal(object)         # laser info dict (or None: no laser slot set)
+    laser_error = Signal(str)
     warning = Signal(str)
     failed = Signal(str)
 
@@ -399,6 +506,11 @@ class Reader(QThread):
         self.cfg = dict(cfg)
         self.interval = max(20, interval_ms) / 1000
         self._stop = False
+        self._requests: queue.SimpleQueue = queue.SimpleQueue()
+
+    def request_laser(self, on: bool) -> None:
+        """Ask the worker to switch the laser (runs between power reads)."""
+        self._requests.put(("laser", bool(on)))
 
     def set_interval(self, ms: int) -> None:
         self.interval = max(20, ms) / 1000
@@ -414,10 +526,16 @@ class Reader(QThread):
                 return
             self.connected.emit(info)
             self.meter_mode.emit(meter.unit, meter.relative)
+            laser = meter.open_laser()
+            self.laser.emit(laser)
+            laser_on = laser.get("on") if laser else None
             failures = 0
             next_mode = time.monotonic() + 2.0
             next_read = time.monotonic()
             while not self._stop:
+                if not self._requests.empty():          # laser switching, between reads
+                    laser = self._handle_requests(meter) or laser
+                    laser_on = laser.get("on") if laser else None
                 try:
                     t, w = meter.read_power()
                     failures = 0
@@ -441,6 +559,12 @@ class Reader(QThread):
                             meter.set_continuous()
                         except Exception as exc:
                             self.warning.emit(str(exc))
+                    if laser and laser.get("present"):   # picked up front-panel switching
+                        now_on = meter.laser_state()
+                        if now_on is not None and now_on != laser_on:
+                            laser_on = now_on
+                            laser = meter.laser_info()
+                            self.laser.emit(laser)
                     next_mode = time.monotonic() + 2.0
                 next_read += self.interval
                 now = time.monotonic()
@@ -448,11 +572,24 @@ class Reader(QThread):
                     next_read = now
                 while not self._stop and time.monotonic() < next_read:
                     time.sleep(min(0.02, max(0.0, next_read - time.monotonic())))
+            self._handle_requests(meter)                # e.g. "laser off" sent on close
         except Exception as exc:
             if not self._stop:
                 self.failed.emit(str(exc))
         finally:
             meter.close()
+
+    def _handle_requests(self, meter: "Meter"):
+        laser = None
+        while not self._requests.empty():
+            what, on = self._requests.get()
+            try:
+                laser = meter.set_laser(on)
+            except Exception as exc:
+                self.laser_error.emit(str(exc))
+                laser = meter.laser_info() if meter.laser_slot else None
+            self.laser.emit(laser)
+        return laser
 
 
 # ---------------------------------------------------------------------------
@@ -561,8 +698,15 @@ class MainWindow(QMainWindow):
         self.resource.setPlaceholderText("GPIB0::20::INSTR")
         self.resource.setMinimumWidth(200)
         self.slot = ispin(1, 4, 36)
+        self.laser_slot = ispin(0, 4, 36)
+        self.laser_slot.setToolTip("Slot of the laser source (e.g. HP 81689A); 0 = none")
         self.timeout = ispin(200, 60000, 60)
         self.timeout.setSuffix(" ms")
+        self.laser_btn = QPushButton("Laser")
+        self.laser_btn.setMinimumWidth(130)
+        self.laser_btn.clicked.connect(self._laser_clicked)
+        self.laser: dict | None = None
+        self.laser_busy = False
         self.start_btn = QPushButton("Start")
         self.start_btn.setMinimumWidth(100)
         self.start_btn.clicked.connect(self.toggle)
@@ -575,10 +719,11 @@ class MainWindow(QMainWindow):
         self.gpib_w = [small("Board"), self.board, small("Address"), self.addr]
         self.visa_w = [small("Resource"), self.resource]
         self.conn_w = ([self.link] + self.serial_w + self.gpib_w + self.visa_w
-                       + [self.slot, self.timeout])
+                       + [self.slot, self.laser_slot, self.timeout])
         root.addLayout(row(small("Connection"), self.link, 6, *self.serial_w, *self.gpib_w,
-                           *self.visa_w, 6, small("Slot"), self.slot, small("Timeout"),
-                           self.timeout, None, self.state, self.start_btn))
+                           *self.visa_w, 6, small("Slot"), self.slot, small("Laser slot"),
+                           self.laser_slot, small("Timeout"), self.timeout, None,
+                           self.laser_btn, 8, self.state, self.start_btn))
         self.meter_info = small("")
         root.addWidget(self.meter_info)
         line = QFrame()
@@ -701,6 +846,7 @@ class MainWindow(QMainWindow):
         self.addr.setValue(int(c["gpib_address"]))
         self.resource.setText(c["resource"])
         self.slot.setValue(int(c["pm_slot"]))
+        self.laser_slot.setValue(int(c["laser_slot"]))
         self.timeout.setValue(int(c["timeout_ms"]))
         self.window_spin.setValue(int(c["window"]))
         self.interval_spin.setValue(int(c["interval_ms"]))
@@ -721,8 +867,9 @@ class MainWindow(QMainWindow):
         self._clock.timeout.connect(self._tick_clock)
         self._clock.start(1000)
         self._set_state("Stopped", "#6b7280", "#f3f4f6")
+        self._show_laser()
         self.redraw()
-        self.resize(1180, 760)
+        self.resize(1240, 760)
 
     # -- settings -------------------------------------------------------------------
     def _load_cfg(self) -> dict:
@@ -761,6 +908,7 @@ class MainWindow(QMainWindow):
         c["gpib_address"] = self.addr.value()
         c["resource"] = self.resource.text().strip()
         c["pm_slot"] = self.slot.value()
+        c["laser_slot"] = self.laser_slot.value()
         c["timeout_ms"] = self.timeout.value()
 
     def _fill_ports(self) -> None:
@@ -785,12 +933,15 @@ class MainWindow(QMainWindow):
         self._save_cfg()
         self.failures_msg = ""
         self._show_note("")
+        self.laser = None
         self.reader = Reader(self.cfg, self.interval_spin.value())
         self.reader.connected.connect(self._on_connected)
         self.reader.meter_mode.connect(self._on_mode)
         self.reader.sample.connect(self._on_sample)
         self.reader.failed.connect(self._on_failed)
         self.reader.warning.connect(self._show_note)
+        self.reader.laser.connect(self._on_laser)
+        self.reader.laser_error.connect(self._on_laser_error)
         self.reader.finished.connect(self._on_finished)
         for w in self.conn_w:
             w.setEnabled(False)
@@ -798,6 +949,7 @@ class MainWindow(QMainWindow):
         self._set_state("Connecting…", "#1d4ed8", "#dbeafe")
         self.meter_info.setText(f"Connecting to {resource_string(self.cfg)}…")
         self.reader.start()
+        self._show_laser()
         self.redraw()
 
     def stop(self) -> None:
@@ -835,6 +987,8 @@ class MainWindow(QMainWindow):
     def _on_finished(self) -> None:
         self.reader = None
         self.running = False
+        self.laser_busy = False
+        self._show_laser()
         for w in self.conn_w:
             w.setEnabled(True)
         self._link_changed()
@@ -848,6 +1002,69 @@ class MainWindow(QMainWindow):
         else:
             self._set_state("Stopped", "#6b7280", "#f3f4f6")
         self.redraw()
+
+    # -- laser ---------------------------------------------------------------------
+    def _laser_clicked(self) -> None:
+        if self.reader is None or not self.laser or not self.laser.get("present"):
+            return
+        turn_on = not self.laser.get("on")
+        if turn_on:
+            wav = self.laser.get("wavelength_m")
+            ans = QMessageBox.question(
+                self, "Laser on",
+                f"Turn ON the laser in slot {self.laser['slot']} ({self.laser.get('model')}"
+                + (f", {wav * 1e9:.2f} nm" if wav else "") + ")?\n\n"
+                "Make sure its output fiber is connected or capped.")
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        self.laser_busy = True
+        self._show_laser(f"Laser: switching {'on' if turn_on else 'off'}…")
+        self.reader.request_laser(turn_on)
+
+    def _on_laser(self, info) -> None:
+        self.laser = info
+        self.laser_busy = False
+        self._show_laser()
+        if info and info.get("present"):
+            wav = info.get("wavelength_m")
+            text = self.meter_info.text().split("   ·   laser")[0]
+            self.meter_info.setText(
+                f"{text}   ·   laser slot {info['slot']}: {info.get('model') or '—'}"
+                + (f" {wav * 1e9:.2f} nm" if wav else ""))
+
+    def _on_laser_error(self, msg: str) -> None:
+        self.laser_busy = False
+        self._show_note(msg)
+        QMessageBox.warning(self, "Laser", msg)
+
+    def _show_laser(self, busy_text: str = "") -> None:
+        b, info, live = self.laser_btn, self.laser, self.reader is not None
+        if not self.cfg.get("laser_slot"):
+            b.setVisible(False)
+            return
+        b.setVisible(True)
+        on = bool(info and info.get("on"))
+        if busy_text:
+            text, tip, enabled = busy_text, "", False
+        elif not live:
+            text = "Laser ON" if (info and info.get("present") and on) else "Laser"
+            tip, enabled = "Press Start to connect, then switch the laser here.", False
+        elif info is None:
+            text, tip, enabled = "Laser…", "Looking for the laser module…", False
+        elif not info.get("present"):
+            text, tip, enabled = "No laser", info.get("why", ""), False
+        else:
+            text = "Laser ON" if on else "Laser off"
+            tip = (f"Slot {info['slot']}: {info.get('module') or '—'}. Click to switch it "
+                   f"{'off' if on else 'on'}.")
+            enabled = not self.laser_busy
+        b.setText(("●  " if on and not busy_text else "") + text)
+        b.setToolTip(tip)
+        b.setEnabled(enabled)
+        b.setStyleSheet("QPushButton { background: #d92d20; color: white; font-weight: 600; "
+                        "border: 1px solid #b42318; border-radius: 4px; padding: 4px 10px; }"
+                        "QPushButton:disabled { background: #f4a19a; color: white; }"
+                        if on and not busy_text else "")
 
     def _set_state(self, text: str, fg: str, bg: str) -> None:
         self.state.setText(text)
@@ -1038,6 +1255,17 @@ class MainWindow(QMainWindow):
         self.st["elapsed"].set(time.strftime("%H:%M:%S", time.gmtime(s)) if s > 0 else "—")
 
     def closeEvent(self, event) -> None:
+        if self.reader is not None and self.laser and self.laser.get("on"):
+            ans = QMessageBox.question(
+                self, "Laser is on",
+                f"The laser in slot {self.laser['slot']} is on. Switch it off before closing?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel)
+            if ans == QMessageBox.StandardButton.Cancel:
+                event.ignore()
+                return
+            if ans == QMessageBox.StandardButton.Yes:
+                self.reader.request_laser(False)       # done by the worker before it closes
         self._save_cfg()
         if self.reader is not None:
             self.reader.stop()

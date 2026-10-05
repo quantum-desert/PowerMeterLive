@@ -1,4 +1,4 @@
-Power Meter Live  v1.4
+Power Meter Live  v1.5
 ======================
 
 A small Windows app that shows a live, rolling plot of the optical power read
@@ -36,6 +36,7 @@ GPIB       Board (usually 0) and address (front panel: Config > GPIB;
            default 20).
 VISA       Any VISA resource string, e.g. GPIB0::20::INSTR or ASRL4::INSTR.
 Slot       The power-meter module's slot (default 2).
+Laser slot The laser source's slot (default 1, e.g. HP 81689A); 0 = none.
 
 On Start the meter is switched to continuous measurement (INIT<n>:CONT 1)
 and FETC<n>:POW? is read every interval. Readings are converted to watts
@@ -57,6 +58,20 @@ Reference        Shows the reading as a percentage of this power (eta).
 Statistics (mean, std dev, min, max) are over the samples in the window.
 Settings are remembered between runs.
 
+
+LASER
+-----
+With a laser slot set, a Laser button appears next to Start once connected:
+"Laser off" (grey) or "Laser ON" (red). Click it to switch the laser output
+(OUTP<n>:STAT, or SOUR<n>:POW:STAT on modules that only know that form);
+switching on asks for confirmation first. The app waits until the module
+reports the new state (up to 8 s) and shows the slot, model and wavelength
+in the line under the connection settings. Switching from the front panel
+is picked up within 2 s.
+- Stop leaves the laser as it is. Closing the app with the laser on asks
+  whether to switch it off first.
+- If it won't switch on and the 8163A's lasers are locked, unlock them on
+  the front panel (laser lock / password; factory password 1234).
 
 TROUBLESHOOTING
 ---------------
@@ -82,8 +97,11 @@ a continuous measurement is an operation that never completes.)
 SINGLE-FILE .EXE (OPTIONAL)
 ---------------------------
 After running run.bat once, double-click build_exe.bat to make
-dist\PowerMeterLive.exe (with the icon), which runs on PCs without Python
-installed. Copy that one file to other PCs.
+PowerMeterLive.exe (with the icon), which runs on PCs without Python
+installed. It is copied to the folder above this one (..\PowerMeterLive.exe);
+copy that one file to other PCs. The .exe contains a frozen copy of the code,
+so run build_exe.bat again after any change to power_meter_live.py (close the
+app first, or the old .exe can't be replaced).
 
 
 FILES
